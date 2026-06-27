@@ -11,12 +11,8 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
 from .activations import swiglu
-from .base import (
-    BaseModelArgs,
-    create_attention_mask,
-    create_ssm_mask,
-    scaled_dot_product_attention,
-)
+from .base import (BaseModelArgs, create_attention_mask, create_ssm_mask,
+                   scaled_dot_product_attention)
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
@@ -53,6 +49,12 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     full_attention_interval: int = 4
+    # Number of native Multi-Token Prediction (MTP) layers. The official
+    # Qwen3-Next checkpoints ship exactly one MTP layer but do not advertise it
+    # in config.json, so this defaults to 0 (MTP off, weights dropped at load,
+    # preserving the behaviour of existing community conversions). Set it to 1
+    # to build the MTP head and enable native self-speculative decoding.
+    mtp_num_hidden_layers: int = 0
 
 
 @partial(mx.compile, shapeless=True)
@@ -233,11 +235,70 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             a.reshape(*a.shape[:2], nv),
         )
 
+    def _process_chunk(
+        self,
+        mixed_qkv: mx.array,
+        a: mx.array,
+        b: mx.array,
+        conv_state: mx.array,
+        ssm_state: Optional[mx.array],
+        mask: Optional[mx.array] = None,
+        lengths: Optional[mx.array] = None,
+    ) -> Tuple[mx.array, mx.array, mx.array]:
+        """Advance the conv window and recurrent state over one chunk of tokens.
+
+        Returns ``(out, new_conv_state, new_ssm_state)`` where ``out`` is the
+        pre-gate-norm Gated DeltaNet output for the chunk and the two states are
+        the carry to feed into the next chunk. Factoring this out lets the
+        caller process the confirmed and draft portions of a speculative step
+        separately and snapshot the carry in between for exact rollback.
+        """
+        B, S_chunk = mixed_qkv.shape[:2]
+        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+
+        n_keep = self.conv_kernel_size - 1
+        if lengths is not None:
+            ends = mx.clip(lengths, 0, S_chunk)
+            positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+            new_conv_state = mx.take_along_axis(conv_input, positions, axis=1)
+        else:
+            new_conv_state = mx.contiguous(conv_input[:, -n_keep:, :])
+
+        conv_out = nn.silu(self.conv1d(conv_input))
+
+        q, k, v = [
+            t.reshape(B, S_chunk, h, d)
+            for t, h, d in zip(
+                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+            )
+        ]
+
+        inv_scale = k.shape[-1] ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+
+        out, new_ssm_state = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            ssm_state,
+            mask,
+            use_kernel=not self.training,
+        )
+        return out, new_conv_state, new_ssm_state
+
     def __call__(
         self,
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         B, S, _ = inputs.shape
         q, k, v, z, b, a = self.fix_query_key_value_ordering(
@@ -251,54 +312,50 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 (B, self.conv_kernel_size - 1, self.conv_dim),
                 dtype=inputs.dtype,
             )
+        ssm_state = cache[1] if cache else None
 
         mixed_qkv = mx.concatenate(
             [q.reshape(B, S, -1), k.reshape(B, S, -1), v.reshape(B, S, -1)], axis=-1
         )
         if mask is not None:
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
-        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
 
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-
-        conv_out = nn.silu(self.conv1d(conv_input))
-
-        q, k, v = [
-            t.reshape(B, S, h, d)
-            for t, h, d in zip(
-                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
-                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
-                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+        if 0 < n_confirmed < S:
+            # Speculative verify step: process the confirmed token(s) and the
+            # draft token(s) as separate chunks so we can snapshot the conv/ssm
+            # carry after the confirmed prefix. On draft rejection the caller
+            # restores this snapshot, which is exact because the carry is the
+            # full recurrent summary up to (and including) the confirmed token.
+            mask_c = mask[:, :n_confirmed] if mask is not None else None
+            mask_d = mask[:, n_confirmed:] if mask is not None else None
+            out_c, conv_c, ssm_c = self._process_chunk(
+                mixed_qkv[:, :n_confirmed],
+                a[:, :n_confirmed],
+                b[:, :n_confirmed],
+                conv_state,
+                ssm_state,
+                mask_c,
             )
-        ]
-
-        state = cache[1] if cache else None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+            if cache is not None:
+                cache.rollback_state = (conv_c, ssm_c)
+            out_d, conv_f, ssm_f = self._process_chunk(
+                mixed_qkv[:, n_confirmed:],
+                a[:, n_confirmed:],
+                b[:, n_confirmed:],
+                conv_c,
+                ssm_c,
+                mask_d,
+            )
+            out = mx.concatenate([out_c, out_d], axis=1)
+        else:
+            lengths = cache.lengths if cache is not None else None
+            out, conv_f, ssm_f = self._process_chunk(
+                mixed_qkv, a, b, conv_state, ssm_state, mask, lengths=lengths
+            )
 
         if cache is not None:
-            cache[1] = state
+            cache[0] = conv_f
+            cache[1] = ssm_f
             cache.advance(S)
 
         out = self.norm(out, z)
@@ -379,14 +436,66 @@ class Qwen3NextDecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(
+                self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
+            )
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
+
+
+class Qwen3NextMTP(nn.Module):
+    """Native Multi-Token Prediction head for Qwen3-Next.
+
+    Given the backbone's pre-norm hidden state ``h_t`` for position ``t`` and
+    the next token ``x_{t+1}``, it predicts the token at ``t+2`` (one step ahead
+    of the backbone), enabling self-speculative decoding with no separate draft
+    model. The official checkpoint ships a single full-attention + MoE
+    transformer layer here, structurally identical to a non-linear
+    ``Qwen3NextDecoderLayer``, plus an EAGLE-style fusion: the separately
+    RMS-normed hidden state and token embedding are concatenated and projected
+    back to ``hidden_size`` by ``fc``. The shared ``embed_tokens``/``lm_head``
+    (applied by the caller) turn the output into logits.
+    """
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        # Force is_linear=False (full attention + MoE) so the block builds
+        # self_attn, matching the checkpoint's mtp.layers.* parameter names.
+        self.layers = [
+            Qwen3NextDecoderLayer(args, layer_idx=args.full_attention_interval - 1)
+            for _ in range(args.mtp_num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        embed_tokens: nn.Embedding,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        embeds = embed_tokens(next_token_ids)
+        e = self.pre_fc_norm_embedding(embeds)
+        h = self.pre_fc_norm_hidden(hidden_states)
+        fused = self.fc(mx.concatenate([e, h], axis=-1))
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(fused, cache[0])
+        for layer, c in zip(self.layers, cache):
+            fused = layer(fused, mask, c)
+
+        return self.norm(fused)
 
 
 class Qwen3NextModel(nn.Module):
@@ -405,8 +514,13 @@ class Qwen3NextModel(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
-        hidden_states = self.embed_tokens(inputs)
+        if input_embeddings is not None:
+            hidden_states = input_embeddings
+        else:
+            hidden_states = self.embed_tokens(inputs)
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -416,9 +530,14 @@ class Qwen3NextModel(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(
+                hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
+            )
 
-        return self.norm(hidden_states)
+        # Return pre-norm hidden states. The final norm is applied by ``Model``
+        # so the MTP head can consume the un-normed backbone hidden state, which
+        # is what it was trained on.
+        return hidden_states
 
 
 class Model(nn.Module):
@@ -429,18 +548,55 @@ class Model(nn.Module):
         self.model = Qwen3NextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = Qwen3NextMTP(args)
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
     ) -> mx.array:
-        out = self.model(inputs, cache)
+        hidden = self.model(
+            inputs, cache, input_embeddings=input_embeddings, n_confirmed=n_confirmed
+        )
+        normed = self.model.norm(hidden)
         if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+            out = self.model.embed_tokens.as_linear(normed)
         else:
-            out = self.lm_head(out)
+            out = self.lm_head(normed)
+        if return_hidden:
+            # Hidden is pre-norm: the MTP head was trained on the un-normed
+            # backbone hidden state.
+            return out, hidden
         return out
+
+    def mtp_forward(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        mtp_cache: Any,
+    ) -> mx.array:
+        """Run the native MTP head and apply the shared output projection.
+
+        Args:
+            hidden_states: Backbone pre-norm hidden state, shape ``(B, N, H)``.
+                ``N == 1`` during decode, ``N > 1`` during prompt prefill.
+            next_token_ids: The token ids one position ahead, shape ``(B, N)``.
+            mtp_cache: KVCache entries for the MTP transformer layer(s), from
+                :meth:`make_mtp_cache`.
+
+        Returns:
+            Logits of shape ``(B, N, vocab_size)``.
+        """
+        mtp_out = self.mtp(
+            hidden_states, next_token_ids, self.model.embed_tokens, mtp_cache
+        )
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(mtp_out)
+        return self.lm_head(mtp_out)
 
     @property
     def layers(self):
@@ -449,16 +605,47 @@ class Model(nn.Module):
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
+    def make_mtp_cache(self):
+        """Return a fresh KVCache per MTP layer, or ``[]`` when MTP is absent."""
+        if hasattr(self, "mtp"):
+            return [KVCache() for _ in self.mtp.layers]
+        return []
+
     def sanitize(self, weights):
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
+            # Already-converted (SwitchGLU format) checkpoint: weights are in
+            # MLX layout and norms are already shifted. Only intervene to drop
+            # the MTP weights when this model has no MTP head to receive them.
+            if not hasattr(self, "mtp"):
+                weights = {k: v for k, v in weights.items() if "mtp." not in k}
             return weights
-        weights = {key: value for key, value in weights.items() if "mtp." not in key}
+
+        # Raw HF checkpoint path.
+        if not hasattr(self, "mtp"):
+            weights = {
+                key: value for key, value in weights.items() if "mtp." not in key
+            }
+        elif not any("mtp." in k for k in weights):
+            raise ValueError(
+                "mtp_num_hidden_layers > 0 but the checkpoint contains no MTP "
+                "weights. Set mtp_num_hidden_layers=0 to disable the MTP head."
+            )
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{l}.mlp"
+        # Stack per-expert MoE weights into SwitchGLU format for the backbone
+        # layers and, when present, the MTP layer(s) (same expert layout).
+        expert_prefixes = [
+            f"model.layers.{l}.mlp" for l in range(self.args.num_hidden_layers)
+        ]
+        if hasattr(self, "mtp"):
+            expert_prefixes += [
+                f"mtp.layers.{l}.mlp" for l in range(self.args.mtp_num_hidden_layers)
+            ]
+        for prefix in expert_prefixes:
+            if f"{prefix}.experts.0.up_proj.weight" not in weights:
+                continue
             for n in ["up_proj", "down_proj", "gate_proj"]:
                 to_join = [
                     weights.pop(f"{prefix}.experts.{e}.{n}.weight")
@@ -472,6 +659,11 @@ class Model(nn.Module):
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            # MTP-specific norms (the reused decoder-layer norms above already
+            # match by suffix).
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         )
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:

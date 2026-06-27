@@ -592,6 +592,13 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    # Snapshot of (conv_state, ssm_state) taken after processing the confirmed
+    # tokens of an MTP / speculative draft-verification step. A recurrent
+    # (Gated DeltaNet / SSM) state cannot be trimmed per-token like a KV cache,
+    # so on draft rejection we restore this snapshot instead. Cleared after
+    # each step. ``None`` when no draft is in flight.
+    rollback_state: Optional[tuple] = None
+
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance.left_padding = None
