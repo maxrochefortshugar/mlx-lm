@@ -4,6 +4,8 @@ import copy
 import hashlib
 import json
 import os
+import queue
+import struct
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -11,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 from .base import create_causal_mask
@@ -1774,6 +1777,90 @@ class LRUPromptCache:
         return result
 
 
+# Metal-safe split serialization for the SSD tier. mx.save / mx.load can
+# deadlock on a worker thread, so the Metal-touching last mile (eval + a
+# reinterpret-to-bytes copy) runs on the inference thread via
+# _extract_cache_for_save, and the actual file write runs on a background
+# thread via _write_safetensors_raw which makes NO mlx call.
+_MX_TO_ST = {
+    mx.float32: "F32",
+    mx.float16: "F16",
+    mx.bfloat16: "BF16",
+    mx.uint8: "U8",
+    mx.uint16: "U16",
+    mx.uint32: "U32",
+    mx.uint64: "U64",
+    mx.int8: "I8",
+    mx.int16: "I16",
+    mx.int32: "I32",
+    mx.int64: "I64",
+    mx.bool_: "BOOL",
+}
+_SIZE_TO_UINT = {1: mx.uint8, 2: mx.uint16, 4: mx.uint32, 8: mx.uint64}
+
+
+def _tensor_to_raw(arr):
+    """(Metal thread) -> (safetensors_dtype, shape, host_array).
+
+    Reinterprets through an unsigned int of the same width so numpy never casts
+    a bfloat16/float16 array (which it cannot represent) -- the bytes are
+    preserved exactly and the true dtype is recorded for the header. Returns the
+    host numpy array (a single device->host copy) rather than serialized bytes,
+    so the second copy (to bytes) and the disk write happen off the inference
+    thread; the array holds no mlx reference, keeping the writer Metal-free.
+    """
+    st = _MX_TO_ST[arr.dtype]
+    shape = list(arr.shape)
+    if arr.size == 0:
+        return st, shape, np.empty(0, dtype=np.uint8)
+    itemsize = arr.nbytes // arr.size
+    return st, shape, np.array(arr.view(_SIZE_TO_UINT[itemsize]))
+
+
+def _extract_cache_for_save(prompt_cache):
+    """(Metal thread) Materialize a prompt cache to plain Python data matching
+    :func:`save_prompt_cache`'s layout: ``(tensors, metadata)`` where ``tensors``
+    maps the flattened name to ``(dtype, shape, raw_bytes)`` and ``metadata`` is
+    the flattened str->str header. No mlx objects are retained afterwards."""
+    cache_data = dict(tree_flatten([c.state for c in prompt_cache]))
+    mx.eval(list(cache_data.values()))
+    tensors = {k: _tensor_to_raw(v) for k, v in cache_data.items()}
+    cache_meta = [
+        [c.meta_state for c in prompt_cache],
+        {},
+        [type(c).__name__ for c in prompt_cache],
+    ]
+    metadata = {str(k): str(v) for k, v in dict(tree_flatten(cache_meta)).items()}
+    return tensors, metadata
+
+
+def _write_safetensors_raw(path, tensors, metadata):
+    """(any thread; NO mlx) Write a safetensors file from raw bytes, atomically.
+
+    Produces a file byte-compatible with ``mx.save_safetensors`` /
+    :func:`load_prompt_cache` (validated by round-trip)."""
+    header, blobs, offset = {}, [], 0
+    for name, (dtype, shape, arr) in tensors.items():
+        nbytes = int(arr.nbytes)
+        header[name] = {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [offset, offset + nbytes],
+        }
+        blobs.append(arr)
+        offset += nbytes
+    header["__metadata__"] = metadata
+    hjson = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    hjson += b" " * (-len(hjson) % 8)  # 8-byte align the data section
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(struct.pack("<Q", len(hjson)))
+        f.write(hjson)
+        for arr in blobs:
+            f.write(np.ascontiguousarray(arr).tobytes())
+    os.replace(tmp, path)
+
+
 class SSDPromptCache(LRUPromptCache):
     """:class:`LRUPromptCache` with a persistent on-disk (SSD) second tier.
 
@@ -1821,6 +1908,13 @@ class SSDPromptCache(LRUPromptCache):
         self._ssd_lru: deque = deque()  # keys, oldest .. newest
         self._ssd_bytes = 0
         self._lock = threading.Lock()
+        # Background writer: the Metal-touching extraction happens on the
+        # inference thread, the disk write is offloaded here so it never blocks
+        # the next request. _pending tracks keys whose file is in flight.
+        self._pending: set = set()
+        self._wq: queue.Queue = queue.Queue(maxsize=8)
+        self._writer = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer.start()
         os.makedirs(ssd_dir, exist_ok=True)
         self._scan_ssd()
 
@@ -1910,38 +2004,70 @@ class SSDPromptCache(LRUPromptCache):
             return
         key = (str(model), tuple(tokens))
         with self._lock:
-            if key in self._ssd:
+            if key in self._ssd or key in self._pending:
                 self._touch(key)
                 return
+            self._pending.add(key)
         spath, jpath = self._paths(model, tokens)
         nbytes = sum(c.nbytes for c in prompt_cache)
         try:
-            # Order matters for crash-safety: the .safetensors is written first,
-            # the sidecar .json (the index's source of truth) last, so a partial
-            # write is simply ignored on the next scan.
-            save_prompt_cache(spath, prompt_cache)
-            with open(jpath, "w") as f:
-                json.dump(
-                    {
-                        "salt": self.salt,
-                        "model": key[0],
-                        "tokens": list(tokens),
-                        "nbytes": nbytes,
-                    },
-                    f,
-                )
+            # Metal-touching extraction MUST run here, on the inference thread.
+            tensors, metadata = _extract_cache_for_save(prompt_cache)
         except Exception:
+            with self._lock:
+                self._pending.discard(key)
+            return
+        meta = {
+            "salt": self.salt,
+            "model": key[0],
+            "tokens": list(tokens),
+            "nbytes": nbytes,
+        }
+        job = (key, spath, jpath, tensors, metadata, meta, nbytes)
+        try:
+            self._wq.put_nowait(job)
+        except queue.Full:
+            # Backpressure: writer is behind. Write inline (disk I/O only -- the
+            # Metal work is already done) rather than grow memory unbounded.
+            self._write_job(job)
+
+    def _writer_loop(self):
+        while True:
+            job = self._wq.get()
             try:
-                os.remove(spath)
-            except OSError:
-                pass
+                if job is not None:
+                    self._write_job(job)
+            finally:
+                self._wq.task_done()
+
+    def _write_job(self, job):
+        key, spath, jpath, tensors, metadata, meta, nbytes = job
+        try:
+            # Crash-safety: the .safetensors lands atomically (temp+rename), then
+            # the sidecar .json (the scan's source of truth) is written last.
+            _write_safetensors_raw(spath, tensors, metadata)
+            with open(jpath, "w") as f:
+                json.dump(meta, f)
+        except Exception:
+            for p in (spath, spath + ".tmp", jpath):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            with self._lock:
+                self._pending.discard(key)
             return
         with self._lock:
+            self._pending.discard(key)
             if key not in self._ssd:
                 self._ssd[key] = (spath, nbytes)
                 self._ssd_lru.append(key)
                 self._ssd_bytes += nbytes
             self._ssd_evict()
+
+    def flush(self):
+        """Block until all queued SSD writes have landed (for tests/shutdown)."""
+        self._wq.join()
 
     @property
     def ssd_nbytes(self):
