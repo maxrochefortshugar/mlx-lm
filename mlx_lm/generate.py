@@ -45,6 +45,10 @@ _CACHE_CLEAR_INTERVAL = 256
 # and the routed-expert gather_qmm are both order-invariant in S.) Draft widths
 # are clamped here so n-gram output is always byte-identical to greedy.
 _NGRAM_MAX_LOSSLESS_DRAFT = 8
+# Bounds for the optional longest-suffix proposer (ngram_suffix): most-recent
+# candidate end-positions scanned, and how far a suffix match is extended.
+_SUFFIX_MAX_CAND = 48
+_SUFFIX_MAX_MATCH = 64
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -1010,6 +1014,8 @@ def ngram_generate_step(
     num_ngram_draft: int = 8,
     ngram_max: int = 3,
     ngram_min: int = 1,
+    ngram_suffix: bool = False,
+    ngram_prev: Optional[List[int]] = None,
     **_unused,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """Lossless n-gram (prompt-lookup) self-speculative decoding.
@@ -1103,6 +1109,49 @@ def ngram_generate_step(
                     return arr[s + m : s + m + num_ngram_draft].tolist()
         return []
 
+    prev_arr = np.asarray(ngram_prev) if ngram_prev else None
+
+    def _propose_suffix(min_len: int) -> List[int]:
+        """Longest-suffix-match proposer (SuffixDecoding/SAM, linear form).
+
+        Finds the LONGEST suffix of the running output that occurred earlier --
+        in the current sequence and, if given, in ``ngram_prev`` (a persistent
+        cross-request store of prior outputs) -- and returns the continuation
+        after the most-recent longest occurrence. A longer, more specific match
+        gives a continuation more likely to keep matching, raising acceptance on
+        repetitive code and re-edited files. ``min_len`` is the shortest match
+        accepted (callers raise it to ``ngram_max`` when parked, so only a long
+        match re-arms drafting). Verify path and byte-identity are unchanged.
+        """
+        arr = np.asarray(history)
+        n = arr.shape[0]
+        if n < 2:
+            return []
+        last = arr[-1]
+        best_len, best_cont = 0, []
+
+        def scan(a, is_hist):
+            nonlocal best_len, best_cont
+            m = a.shape[0]
+            cand = np.flatnonzero(a[: (m - 1 if is_hist else m)] == last)
+            for j in cand[::-1][:_SUFFIX_MAX_CAND]:
+                j = int(j)
+                k, kmax = 0, min(_SUFFIX_MAX_MATCH, j + 1, n)
+                while k < kmax and a[j - k] == arr[n - 1 - k]:
+                    k += 1
+                if k > best_len:
+                    best_len = k
+                    best_cont = a[j + 1 : j + 1 + num_ngram_draft].tolist()
+                    if k >= kmax:
+                        break
+
+        scan(arr, True)
+        if prev_arr is not None and prev_arr.shape[0] > 0:
+            scan(prev_arr, False)
+        return best_cont if best_len >= min_len else []
+
+    propose = _propose_suffix if ngram_suffix else _propose
+
     def _prefill(y):
         while y.size > 1:
             n = min(prefill_step_size, y.size - 1)
@@ -1192,7 +1241,7 @@ def ngram_generate_step(
                     # Re-arm drafting only on a strict full-length match (the
                     # cheap echo detector): emit the already-dispatched
                     # look-ahead token and hand off to the verify path.
-                    if have_ahead and _propose(ngram_max):
+                    if have_ahead and propose(ngram_max):
                         draft_budget = 1
                         a = ahead_tok.item()
                         history.append(a)
@@ -1209,12 +1258,12 @@ def ngram_generate_step(
             if remaining <= 1:
                 drafts = []  # only the bonus fits; skip the proposer entirely
             elif draft_budget > 0:
-                drafts = _propose(ngram_min)
+                drafts = propose(ngram_min)
                 if not drafts:
                     # Drifting out of an echo region: let the budget decay.
                     draft_budget = max(0, draft_budget - 1)
             else:
-                drafts = _propose(ngram_max)  # strict probe
+                drafts = propose(ngram_max)  # strict probe
             # Leave room for the always-emitted bonus token.
             width = draft_budget if draft_budget > 0 else 1
             K = max(0, min(len(drafts), width, remaining - 1))
