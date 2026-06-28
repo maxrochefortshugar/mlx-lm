@@ -868,29 +868,34 @@ def mtp_generate_step(
     last_cache_block = 0
     draft_tok = draft_lp = draft_accept_lp = draft_xtc_draw = None
 
+    # Hot-loop note: keep tokens as on-device arrays (.reshape().astype()) rather
+    # than round-tripping through .item()/mx.array, and dispatch the next draft
+    # with async_eval so its (small) GPU work overlaps the host-side yields. Each
+    # round forces exactly one host sync: the accept decision (data-dependent
+    # control flow makes it unavoidable). RNG draw order is unchanged so greedy
+    # output stays byte-identical and sampling stays distribution-correct.
     while ntoks < max_tokens:
         if draft_tok is None:
-            # No pending draft: run backbone only, then generate first draft.
+            # No pending draft: run backbone only, then generate the first draft.
             toks, lps, accept_lps, hidden, prev_tokens = _step_backbone(
                 y, prev_tokens, n_predict=1
             )
-            mx.eval(toks)
             main_tok, main_lp = toks[0], lps[0]
-            ntoks += 1
-            yield main_tok.item(), main_lp, False
-            if ntoks >= max_tokens:
-                return
             hidden_at_main = hidden[:, -1:, :]
             draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
                 hidden_at_main, main_tok, prev_tokens
             )
-            mx.eval(draft_tok)
-            y = mx.array([main_tok.item()], mx.uint32)
+            mx.async_eval(main_tok, draft_tok)
+            y = main_tok.reshape(1).astype(mx.uint32)
+            ntoks += 1
+            yield main_tok.item(), main_lp, False
+            if ntoks >= max_tokens:
+                return
         else:
             # Verify draft: run backbone over [y, draft_tok].
             # n_confirmed=1 makes the Gated DeltaNet snapshot its ssm/conv state
             # after the confirmed token y, enabling exact rollback on rejection.
-            y_with_draft = mx.concatenate([y, mx.array([draft_tok.item()], mx.uint32)])
+            y_with_draft = mx.concatenate([y, draft_tok.reshape(1).astype(mx.uint32)])
             toks, lps, accept_lps, hidden, prev_tokens = _step_backbone(
                 y_with_draft,
                 prev_tokens,
@@ -898,52 +903,54 @@ def mtp_generate_step(
                 n_confirmed=1,
                 xtc_draw=draft_xtc_draw,
             )
-            u = mx.random.uniform()
-            mx.eval(toks, draft_tok, u)
-
+            u = mx.random.uniform()  # drawn every round to keep RNG order stable
             verify_pred, bonus_tok = toks[0], toks[1]
             verify_lp, bonus_lp = lps[0], lps[1]
             verify_accept_lp = accept_lps[0]
-            draft_tok_id = draft_tok.item()
+            hidden_at_confirmed = hidden[:, 0:1, :]
+            hidden_at_draft = hidden[:, 1:2, :]
 
             if _is_greedy:
-                accept = verify_pred.item() == draft_tok_id
+                # Single host sync for the branch; tokens stay on device.
+                accept_arr = verify_pred == draft_tok
+                mx.eval(accept_arr)
+                accept = accept_arr.item()
             else:
                 # Probabilistic acceptance: min(1, p_target/p_draft).
+                draft_tok_id = draft_tok.item()
                 log_accept = (
                     verify_accept_lp[draft_tok_id] - draft_accept_lp[draft_tok_id]
                 ).item()
                 accept = log_accept >= 0 or u.item() < math.exp(log_accept)
 
-            hidden_at_confirmed = hidden[:, 0:1, :]
-            hidden_at_draft = hidden[:, 1:2, :]
-
             if accept:
                 _clear_rollback()
+                # Dispatch the next draft first so its GPU work overlaps the
+                # two yields below.
+                draft_next = _step_mtp(
+                    hidden_at_draft,
+                    bonus_tok,
+                    prev_tokens,
+                    cache_commit=(hidden_at_confirmed, draft_tok),
+                )
+                mx.async_eval(bonus_tok, draft_next[0])
+                y = bonus_tok.reshape(1).astype(mx.uint32)
                 ntoks += 1
-                yield draft_tok_id, draft_lp, True
+                yield draft_tok.item(), draft_lp, True
                 if ntoks >= max_tokens:
                     return
                 ntoks += 1
                 yield bonus_tok.item(), bonus_lp, False
                 if ntoks >= max_tokens:
                     return
-                # Next draft: one batched forward aligns the cache for the
-                # accepted draft token and generates the next draft together.
-                draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
-                    hidden_at_draft,
-                    bonus_tok,
-                    prev_tokens,
-                    cache_commit=(hidden_at_confirmed, draft_tok),
-                )
-                mx.eval(draft_tok)
-                y = mx.array([bonus_tok.item()], mx.uint32)
+                draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = draft_next
             else:
                 _rollback_draft()
                 if logits_processors and prev_tokens is not None:
                     prev_tokens = prev_tokens[:-1]  # discard rejected draft token
-                verify_tok_id = verify_pred.item()
-                if not _is_greedy:
+                if _is_greedy:
+                    verify_tok = verify_pred
+                else:
                     # Sample from the residual max(p_target - p_draft, 0) / Z
                     # (Leviathan et al. 2022 §2.3; Chen et al. 2023) so the output
                     # marginal equals the target distribution exactly.
@@ -952,21 +959,20 @@ def mtp_generate_step(
                     residual = mx.maximum(p_target - p_draft, 0.0)
                     z = residual.sum(keepdims=True)
                     dist = mx.where(z > 0, residual, p_target)
-                    verify_tok_id = mx.random.categorical(
-                        mx.log(dist).reshape(1, -1)
-                    ).item()
-                ntoks += 1
-                yield verify_tok_id, verify_lp, False
-                if ntoks >= max_tokens:
-                    return
-                # Next draft from MTP at y's hidden state.
-                draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
+                    verify_tok = mx.random.categorical(mx.log(dist).reshape(1, -1))[0]
+                # Next draft from the confirmed (verify) position.
+                draft_next = _step_mtp(
                     hidden_at_confirmed,
-                    mx.array([verify_tok_id], mx.uint32),
+                    verify_tok.reshape(1).astype(mx.uint32),
                     prev_tokens,
                 )
-                mx.eval(draft_tok)
-                y = mx.array([verify_tok_id], mx.uint32)
+                mx.async_eval(verify_tok, draft_next[0])
+                y = verify_tok.reshape(1).astype(mx.uint32)
+                ntoks += 1
+                yield verify_tok.item(), verify_lp, False
+                if ntoks >= max_tokens:
+                    return
+                draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = draft_next
         block = ntoks // _CACHE_CLEAR_INTERVAL
         if block > last_cache_block:
             mx.clear_cache()
