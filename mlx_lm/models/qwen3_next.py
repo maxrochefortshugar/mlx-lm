@@ -422,7 +422,12 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        # Discrete expert selection: stop_gradient so autodiff never tries to
+        # differentiate through the (non-differentiable) routing indices -- the
+        # router learns via the continuous ``scores`` below, the standard MoE
+        # training path. Forward-identical (no-op at inference), so byte-identity
+        # is preserved; required to fine-tune any MoE block (e.g. the MTP head).
+        inds = mx.stop_gradient(mx.argpartition(gates, kth=-k, axis=-1)[..., -k:])
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
