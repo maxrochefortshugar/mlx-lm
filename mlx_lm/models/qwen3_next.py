@@ -11,8 +11,12 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
 from .activations import swiglu
-from .base import (BaseModelArgs, create_attention_mask, create_ssm_mask,
-                   scaled_dot_product_attention)
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope

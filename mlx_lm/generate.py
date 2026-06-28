@@ -12,8 +12,7 @@ import warnings
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
-from typing import (Any, Callable, Generator, List, Optional, Sequence, Tuple,
-                    Union)
+from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -22,11 +21,18 @@ from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .models import cache
-from .models.cache import (ArraysCache, BatchKVCache, BatchRotatingKVCache,
-                           CacheList, KVCache, QuantizedKVCache,
-                           RotatingKVCache, TokenBuffer, load_prompt_cache)
-from .sample_utils import (categorical_sampling, make_sampler,
-                           make_sampler_chain)
+from .models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    BatchRotatingKVCache,
+    CacheList,
+    KVCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+    TokenBuffer,
+    load_prompt_cache,
+)
+from .sample_utils import categorical_sampling, make_sampler, make_sampler_chain
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
