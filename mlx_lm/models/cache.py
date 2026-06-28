@@ -1872,15 +1872,30 @@ class SSDPromptCache(LRUPromptCache):
     idea oMLX ships, ported into our own server so it composes with our n-gram
     decode path.
 
-    Correctness: serialization uses :func:`save_prompt_cache` /
-    :func:`load_prompt_cache`, which round-trip a Qwen3-Next hybrid cache
-    (trimmable ``KVCache`` + non-trimmable recurrent ``ArraysCache``) losslessly.
+    Correctness: serialization round-trips a Qwen3-Next hybrid cache (trimmable
+    ``KVCache`` + non-trimmable recurrent ``ArraysCache``) bit-exactly -- every
+    state array is byte-identical after save/load (validated array-by-array).
     Because the recurrent state cannot be trimmed, a stored cache is reusable
     only at its exact stored length (an exact or shorter token-prefix of the new
-    request) -- the suffix is then prefilled, giving output byte-identical to a
-    fresh prefill (validated). Saves run synchronously on the calling thread:
-    ``mx.save``/``mx.load`` on a worker thread can deadlock on Metal, and the
-    cache is final once a request completes, so this also avoids aliasing.
+    request); the suffix is then prefilled. The result is byte-identical to
+    mlx-lm's in-memory prefix-cache reuse -- i.e. restoring from SSD changes
+    nothing versus the stock :class:`LRUPromptCache` path, it just persists that
+    same state across restarts and evictions (validated: SSD == in-memory reuse
+    at 2k/4k/8k+ contexts). NOTE: like *any* prefix cache for this recurrent
+    model, the reused path can differ from a single from-scratch prefill by the
+    Gated-DeltaNet chunk-boundary numerics (the upstream chunked linear-attention
+    prefill produces a marginally different recurrent carry than incremental
+    stepping across the cache boundary); the SSD tier adds no divergence beyond
+    what the in-memory cache already has.
+
+    Saves are split across the Metal boundary: the Metal-touching last mile
+    (``mx.eval`` + a reinterpret-to-bytes device->host copy, via
+    :func:`_extract_cache_for_save`) runs on the inference thread, and the actual
+    file write (:func:`_write_safetensors_raw`, which makes NO mlx call) is
+    offloaded to a background daemon writer so it never blocks the next request.
+    ``mx.save``/``mx.load`` on a worker thread can deadlock on Metal, which is why
+    the writer is hand-rolled and Metal-free. The cache is final once a request
+    completes, so the extracted snapshot cannot be mutated under the writer.
 
     Single-stream only: the batched caches don't serialize ``lengths`` /
     ``left_padding``. Qwen3-Next is non-batchable so this is the served path.
