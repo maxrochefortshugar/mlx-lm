@@ -17,6 +17,7 @@ from typing import (Any, Callable, Generator, List, Optional, Sequence, Tuple,
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
@@ -32,6 +33,15 @@ from .utils import does_model_support_input_embeddings, load
 # How often (in generated tokens) to release MLX's buffer cache during long
 # generations to keep peak memory bounded.
 _CACHE_CLEAR_INTERVAL = 256
+
+# Largest n-gram draft width whose single batched verify pass stays bit-identical
+# to token-by-token decoding on Qwen3-Next. The Gated DeltaNet chunked Metal
+# kernel (gated_delta_kernel) reproduces the sequential recurrence exactly only
+# for short chunks: a verify over [confirmed, *drafts] of length 1 + K matches
+# sequential decoding bit-for-bit through K = 3 (S = 4) and starts to drift at
+# K = 4 (S = 5), which would silently break the lossless guarantee. Draft widths
+# are clamped to this so n-gram output is always byte-identical to greedy.
+_NGRAM_MAX_LOSSLESS_DRAFT = 3
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -983,6 +993,252 @@ def mtp_generate_step(
             last_cache_block = block
 
 
+def ngram_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    num_ngram_draft: int = 8,
+    ngram_max: int = 3,
+    ngram_min: int = 1,
+    **_unused,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """Lossless n-gram (prompt-lookup) self-speculative decoding.
+
+    Draft tokens are proposed with zero model cost by string-matching the most
+    recent tokens against earlier context (Saxena 2023, "prompt lookup
+    decoding"), then verified in a single backbone pass; the longest matching
+    prefix plus one always-correct bonus token is accepted. Output is
+    byte-identical to greedy :func:`generate_step`: a draft is kept only when it
+    equals the model's own argmax, and a one-pass forward over ``[y, *drafts]``
+    yields the same per-position logits as stepping token-by-token (causal
+    masking + float32 recurrent carry).
+
+    Unlike :func:`speculative_generate_step` this needs no trimmable cache. The
+    recurrent (Gated DeltaNet) layers snapshot their conv/ssm carry after the
+    confirmed token (``n_confirmed=1``) and restore it when drafts are rejected
+    (see ``ArraysCache.rollback_state``); attention (KVCache) layers trim the
+    rejected draft entries. On a partial accept the recurrent carry is advanced
+    to the accepted boundary by replaying just the accepted drafts.
+
+    Greedy only -- the dispatcher routes here solely when ``temp == 0`` and no
+    draft model / MTP head is requested. Effective on agentic/coding turns where
+    the model echoes spans of the prompt (file contents, identifiers, edits).
+
+    The draft width is clamped to :data:`_NGRAM_MAX_LOSSLESS_DRAFT` (the widest
+    verify that the Gated DeltaNet kernel keeps bit-identical to sequential) and
+    adapts per step: it grows while drafts are accepted and decays toward zero
+    when they miss, with cheap periodic probing to re-detect echo. So low-echo
+    turns fall back to plain decoding (no wide-verify overhead) instead of
+    regressing, while echo-heavy turns get the full speedup.
+
+    Args:
+        num_ngram_draft (int): Max draft tokens proposed per step. Clamped to
+          ``_NGRAM_MAX_LOSSLESS_DRAFT`` to preserve byte-identical output.
+          Default: ``8``.
+        ngram_max (int): Longest trailing n-gram tried as the match key. Larger
+          is more precise but matches less often. Default: ``3``.
+        ngram_min (int): Shortest trailing n-gram tried before giving up.
+          Default: ``1``.
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: ``(token, log-probabilities, from_draft)``.
+            ``from_draft`` is ``True`` for accepted n-gram drafts.
+    """
+    if num_ngram_draft > _NGRAM_MAX_LOSSLESS_DRAFT:
+        warnings.warn(
+            f"num_ngram_draft={num_ngram_draft} exceeds the lossless limit; "
+            f"clamping to {_NGRAM_MAX_LOSSLESS_DRAFT}. Wider verifies drift from "
+            "sequential decoding on Qwen3-Next and would break byte-identity.",
+            stacklevel=2,
+        )
+    num_ngram_draft = max(0, min(num_ngram_draft, _NGRAM_MAX_LOSSLESS_DRAFT))
+
+    y = prompt.astype(mx.uint32)
+
+    model_cache = (
+        prompt_cache if prompt_cache is not None else cache.make_prompt_cache(model)
+    )
+
+    quantize_cache_fn = partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    has_processors = bool(logits_processors)
+    # Token history (prompt + everything accepted) drives the n-gram proposer
+    # and, when logits processors are active, supplies their running context.
+    # history[-1] is always ``y`` (the current unprocessed token).
+    history: List[int] = prompt.tolist()
+
+    def _propose(min_len: int) -> List[int]:
+        """Rightmost earlier match of the trailing n-gram -> its continuation.
+
+        ``min_len`` is the shortest match key accepted: callers raise it to
+        ``ngram_max`` when parked (budget 0) so only a long, specific match --
+        rare in prose, ubiquitous in echoed code -- triggers a probe verify.
+        """
+        arr = np.asarray(history)
+        n = arr.shape[0]
+        hi = min(ngram_max, n - 1)
+        for m in range(hi, min_len - 1, -1):
+            pat = arr[-m:]
+            # Candidate starts 0..n-m-1 (exclude the trailing suffix itself),
+            # pre-filtered to those whose first token matches, scanned rightmost.
+            cand = np.flatnonzero(arr[: n - m] == pat[0])
+            for j in range(cand.shape[0] - 1, -1, -1):
+                s = int(cand[j])
+                if np.array_equal(arr[s : s + m], pat):
+                    return arr[s + m : s + m + num_ngram_draft].tolist()
+        return []
+
+    def _prefill(y):
+        while y.size > 1:
+            n = min(prefill_step_size, y.size - 1)
+            model(y[:n][None], cache=model_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache])
+            y = y[n:]
+            mx.clear_cache()
+        return y
+
+    def _clear_rollback():
+        for c in model_cache:
+            if getattr(c, "rollback_state", None) is not None:
+                c.rollback_state = None
+
+    def _rollback_to_confirmed(num_draft):
+        """Restore caches to the state after the confirmed token ``y``.
+
+        Recurrent layers restore the conv/ssm snapshot taken at ``n_confirmed``;
+        attention layers trim the ``num_draft`` rejected draft entries.
+        """
+        for c in model_cache:
+            rs = getattr(c, "rollback_state", None)
+            if rs is not None:
+                c[0], c[1] = rs
+                c.rollback_state = None
+            elif c.is_trimmable():
+                c.trim(num_draft)
+
+    with mx.stream(generation_stream):
+        y = _prefill(y)
+
+    ntoks = 0
+    last_cache_block = 0
+    # Adaptive draft budget: grow while drafts land, decay toward 0 when they
+    # miss so non-echo stretches stop paying the wide-verify cost. While parked
+    # at 0 the proposer itself is the echo detector -- it only proposes (a single
+    # probe draft) on a full ngram_max-length match, which is rare in prose but
+    # ubiquitous in echoed code, so a verify is spent only when echo likely
+    # resumed. None of this changes which tokens are emitted (always the greedy
+    # argmax), so output stays byte-identical regardless of the budget.
+    draft_budget = num_ngram_draft
+    try:
+        while ntoks < max_tokens:
+            remaining = max_tokens - ntoks
+            if remaining <= 1:
+                drafts = []  # only the bonus fits; skip the proposer entirely
+            elif draft_budget > 0:
+                drafts = _propose(ngram_min)
+                if not drafts:
+                    # Drifting out of an echo region: let the budget decay.
+                    draft_budget = max(0, draft_budget - 1)
+            else:
+                drafts = _propose(ngram_max)  # strict probe
+            # Leave room for the always-emitted bonus token.
+            width = draft_budget if draft_budget > 0 else 1
+            K = max(0, min(len(drafts), width, remaining - 1))
+            drafts = drafts[:K]
+            n_confirmed = 1 if K > 0 else 0
+
+            with mx.stream(generation_stream):
+                if K > 0:
+                    y_in = mx.concatenate([y, mx.array(drafts, mx.uint32)])
+                else:
+                    y_in = y
+                logits = model(y_in[None], cache=model_cache, n_confirmed=n_confirmed)
+                logits = logits[0]  # [S, V], S == 1 + K
+                quantize_cache_fn(model_cache)
+
+                if has_processors:
+                    base = mx.array(history, mx.uint32)
+                    toks, lps = [], []
+                    for i in range(logits.shape[0]):
+                        ctx = (
+                            base
+                            if i == 0
+                            else mx.concatenate([base, mx.array(drafts[:i], mx.uint32)])
+                        )
+                        row = logits[i][None]
+                        for p in logits_processors:
+                            row = p(ctx, row)
+                        row = row[0]
+                        lps.append(row - mx.logsumexp(row, axis=-1, keepdims=True))
+                        toks.append(mx.argmax(row, axis=-1))
+                    logprobs_all = mx.stack(lps)
+                    preds = mx.stack(toks)
+                else:
+                    # argmax(logits) == argmax(logprobs); keep logprobs lazy so an
+                    # accepted round that never reads them prunes the logsumexp.
+                    logprobs_all = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+                    preds = mx.argmax(logits, axis=-1)
+
+            mx.eval(preds)  # one host sync: forces the verify pass, not the snapshot
+            preds_l = preds.tolist()
+
+            # Greedy accept: longest draft prefix matching the model's own argmax.
+            n_acc = 0
+            while n_acc < K and preds_l[n_acc] == drafts[n_acc]:
+                n_acc += 1
+            bonus = preds_l[n_acc]  # corrected/next token after the accepted prefix
+
+            if K > 0:
+                if n_acc == K:
+                    # All drafts accepted: live cache already holds [y, *drafts];
+                    # drop the (still-lazy) rollback snapshot so it is pruned.
+                    _clear_rollback()
+                    draft_budget = min(num_ngram_draft, draft_budget + 1)
+                else:
+                    _rollback_to_confirmed(K)
+                    if n_acc > 0:
+                        with mx.stream(generation_stream):
+                            model(
+                                mx.array(drafts[:n_acc], mx.uint32)[None],
+                                cache=model_cache,
+                            )
+                            quantize_cache_fn(model_cache)
+                    draft_budget = max(0, draft_budget - 1)
+
+            for i in range(n_acc):
+                ntoks += 1
+                history.append(drafts[i])
+                yield drafts[i], logprobs_all[i], True
+                if ntoks >= max_tokens:
+                    return
+            ntoks += 1
+            history.append(bonus)
+            yield bonus, logprobs_all[n_acc], False
+            if ntoks >= max_tokens:
+                return
+            y = mx.array([bonus], mx.uint32)
+
+            block = ntoks // _CACHE_CLEAR_INTERVAL
+            if block > last_cache_block:
+                mx.clear_cache()
+                last_cache_block = block
+    finally:
+        _clear_rollback()
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -990,6 +1246,7 @@ def stream_generate(
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
     mtp: bool = False,
+    ngram: bool = False,
     temp: float = 0.0,
     top_p: float = 0.0,
     top_k: int = 0,
@@ -1066,6 +1323,12 @@ def stream_generate(
             xtc_special_tokens=xtc_special_tokens,
             **kwargs,
         )
+    elif ngram and temp == 0:
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("sampler", None)  # ngram_generate_step is greedy
+        token_generator = ngram_generate_step(prompt, model, **kwargs)
     else:
         if mtp:
             warnings.warn(
@@ -1073,6 +1336,15 @@ def stream_generate(
                 "standard generation.",
                 stacklevel=2,
             )
+        if ngram:
+            warnings.warn(
+                "ngram=True ignored: n-gram speculative decoding requires greedy "
+                "decoding (temp=0). Falling back to standard generation.",
+                stacklevel=2,
+            )
+        kwargs.pop("num_ngram_draft", None)
+        kwargs.pop("ngram_max", None)
+        kwargs.pop("ngram_min", None)
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation

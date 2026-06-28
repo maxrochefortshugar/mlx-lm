@@ -683,12 +683,13 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
-        # MTP is a single-stream generator, so force its requests onto the
-        # non-batched _serve_single path.
+        # MTP and n-gram are single-stream generators, so force their requests
+        # onto the non-batched _serve_single path.
         return (
             self.model_provider.is_batchable
             and args.seed is None
             and not self.model_provider.cli_args.mtp
+            and not self.model_provider.cli_args.ngram
         )
 
     def _generate(self):
@@ -976,6 +977,14 @@ class ResponseGenerator:
             # `mtp_forward` is always defined; the MTP head (`self.mtp`) only
             # exists when the checkpoint carries one, so gate on that.
             use_mtp = self.model_provider.cli_args.mtp and hasattr(model, "mtp")
+            # n-gram (prompt-lookup) speculative decoding is lossless only for
+            # greedy decoding, so enable it just for temperature-0 requests; other
+            # requests fall through to the standard sampling path.
+            use_ngram = (
+                self.model_provider.cli_args.ngram
+                and not use_mtp
+                and args.sampling.temperature == 0
+            )
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if use_mtp:
@@ -994,11 +1003,19 @@ class ResponseGenerator:
                 sampler=sampler,
                 logits_processors=logits_processors,
                 prompt_cache=cache,
-                draft_model=None if use_mtp else draft_model,
+                draft_model=None if (use_mtp or use_ngram) else draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
             )
+            if use_ngram:
+                # stream_generate's n-gram path is greedy and proposes drafts by
+                # prompt lookup; it ignores `sampler` but still applies
+                # logits_processors. Output is byte-identical to greedy decoding.
+                gen_kwargs.update(
+                    ngram=True,
+                    num_ngram_draft=self.cli_args.num_ngram_draft,
+                )
             if use_mtp:
                 # stream_generate's MTP path samples internally from these
                 # (it ignores `sampler`); logits_processors still apply.
@@ -1825,6 +1842,23 @@ def main():
         help="Use the model's native Multi-Token Prediction head for "
         "self-speculative decoding (e.g. Qwen3-Next converted with "
         "mtp_num_hidden_layers=1). Forces single-stream (non-batched) serving.",
+    )
+    parser.add_argument(
+        "--ngram",
+        action="store_true",
+        help="Use lossless n-gram (prompt-lookup) speculative decoding: draft "
+        "tokens are proposed by matching recent text against earlier context, "
+        "no draft model needed. Applies to greedy (temperature 0) requests only; "
+        "output is byte-identical to greedy decoding. Forces single-stream "
+        "serving. Effective on agentic/coding turns that echo the prompt.",
+    )
+    parser.add_argument(
+        "--num-ngram-draft",
+        type=int,
+        default=3,
+        help="Max draft tokens proposed per step for --ngram. Capped at 3, the "
+        "widest verify that stays byte-identical to greedy on Qwen3-Next "
+        "(default: 3).",
     )
     parser.add_argument(
         "--trust-remote-code",
