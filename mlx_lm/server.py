@@ -40,6 +40,7 @@ from .generate import (
 )
 from .models.cache import (
     LRUPromptCache,
+    SSDPromptCache,
     make_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
@@ -1786,7 +1787,26 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    _ca = model_provider.cli_args
+    if _ca.prompt_cache_ssd_dir:
+        # Salt the on-disk key with everything that changes cache validity but is
+        # not in the token key: the decode composition (MTP/draft/n-gram alter the
+        # cache layer layout). The model identity is already part of the key.
+        salt = f"mtp={_ca.mtp}|ngram={_ca.ngram}|draft={_ca.draft_model}"
+        prompt_cache = SSDPromptCache(
+            _ca.prompt_cache_size,
+            ssd_dir=_ca.prompt_cache_ssd_dir,
+            ssd_max_bytes=int(_ca.prompt_cache_ssd_gb * (1 << 30)),
+            ssd_min_tokens=_ca.prompt_cache_ssd_min_tokens,
+            salt=salt,
+        )
+        logging.info(
+            f"SSD prompt cache at {_ca.prompt_cache_ssd_dir} "
+            f"(cap {_ca.prompt_cache_ssd_gb:.0f} GB, "
+            f"{prompt_cache.ssd_stats()['n_entries']} entries restored)"
+        )
+    else:
+        prompt_cache = LRUPromptCache(_ca.prompt_cache_size)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -1948,6 +1968,29 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-ssd-dir",
+        type=str,
+        default=None,
+        help="Persist prompt caches to this directory (SSD second tier). A "
+        "returning long prefix is restored from disk instead of re-prefilled "
+        "(big TTFT win on multi-turn agentic contexts). Output is byte-identical "
+        "to fresh prefill. Single-stream serving only.",
+    )
+    parser.add_argument(
+        "--prompt-cache-ssd-gb",
+        type=float,
+        default=20.0,
+        help="Max size (GB) of the on-disk prompt cache (default: 20).",
+    )
+    parser.add_argument(
+        "--prompt-cache-ssd-min-tokens",
+        type=int,
+        default=512,
+        help="Only persist prompt caches for prefixes at least this long "
+        "(default: 512); short prefixes aren't worth the fixed recurrent-state "
+        "footprint.",
     )
     parser.add_argument(
         "--pipeline",

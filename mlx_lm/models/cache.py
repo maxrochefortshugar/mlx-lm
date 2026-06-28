@@ -1,6 +1,10 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import hashlib
+import json
+import os
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -1768,3 +1772,180 @@ class LRUPromptCache:
                 "n_bytes": self._n_bytes_by_type[cache_type],
             }
         return result
+
+
+class SSDPromptCache(LRUPromptCache):
+    """:class:`LRUPromptCache` with a persistent on-disk (SSD) second tier.
+
+    A returning long agentic prefix is the dominant TTFT cost: the same system
+    prompt + file context is re-sent every turn and re-prefilled from scratch.
+    This tier persists each completed request's full prompt cache to disk
+    (write-through, gated on a minimum length) so a later request that shares a
+    token prefix restores that state and prefills only the new suffix -- the
+    idea oMLX ships, ported into our own server so it composes with our n-gram
+    decode path.
+
+    Correctness: serialization uses :func:`save_prompt_cache` /
+    :func:`load_prompt_cache`, which round-trip a Qwen3-Next hybrid cache
+    (trimmable ``KVCache`` + non-trimmable recurrent ``ArraysCache``) losslessly.
+    Because the recurrent state cannot be trimmed, a stored cache is reusable
+    only at its exact stored length (an exact or shorter token-prefix of the new
+    request) -- the suffix is then prefilled, giving output byte-identical to a
+    fresh prefill (validated). Saves run synchronously on the calling thread:
+    ``mx.save``/``mx.load`` on a worker thread can deadlock on Metal, and the
+    cache is final once a request completes, so this also avoids aliasing.
+
+    Single-stream only: the batched caches don't serialize ``lengths`` /
+    ``left_padding``. Qwen3-Next is non-batchable so this is the served path.
+    """
+
+    def __init__(
+        self,
+        max_size: int = 10,
+        max_bytes: int = 1 << 63,
+        *,
+        ssd_dir: str,
+        ssd_max_bytes: int = 20 << 30,
+        ssd_min_tokens: int = 512,
+        salt: str = "",
+    ):
+        super().__init__(max_size, max_bytes)
+        self.ssd_dir = ssd_dir
+        self.ssd_max_bytes = ssd_max_bytes
+        self.ssd_min_tokens = ssd_min_tokens
+        # The salt isolates entries by anything that changes cache validity but
+        # is not in the token key: model identity, KV-quant config, and the
+        # decode composition (MTP/draft change the cache layer layout).
+        self.salt = salt
+        self._ssd: Dict[tuple, tuple] = {}  # (model, tokens) -> (path, nbytes)
+        self._ssd_lru: deque = deque()  # keys, oldest .. newest
+        self._ssd_bytes = 0
+        self._lock = threading.Lock()
+        os.makedirs(ssd_dir, exist_ok=True)
+        self._scan_ssd()
+
+    def _paths(self, model, tokens):
+        h = hashlib.sha256()
+        for part in (self.salt, str(model)):
+            h.update(part.encode())
+            h.update(b"\x00")
+        h.update(json.dumps(list(tokens)).encode())
+        base = os.path.join(self.ssd_dir, h.hexdigest())
+        return base + ".safetensors", base + ".json"
+
+    def _scan_ssd(self):
+        """Rebuild the index from sidecar JSONs (cheap; avoids loading arrays)."""
+        for fn in sorted(os.listdir(self.ssd_dir)):
+            if not fn.endswith(".json"):
+                continue
+            jpath = os.path.join(self.ssd_dir, fn)
+            spath = jpath[:-5] + ".safetensors"
+            try:
+                with open(jpath) as f:
+                    meta = json.load(f)
+                if meta.get("salt") != self.salt or not os.path.exists(spath):
+                    continue
+                key = (meta["model"], tuple(meta["tokens"]))
+                nbytes = int(meta["nbytes"])
+            except Exception:
+                continue
+            if key not in self._ssd:
+                self._ssd[key] = (spath, nbytes)
+                self._ssd_lru.append(key)
+                self._ssd_bytes += nbytes
+        self._ssd_evict()
+
+    def _drop(self, key):
+        path, nbytes = self._ssd.pop(key, (None, 0))
+        self._ssd_bytes -= nbytes
+        try:
+            self._ssd_lru.remove(key)
+        except ValueError:
+            pass
+        if path is not None:
+            for p in (path, path[: -len(".safetensors")] + ".json"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    def _ssd_evict(self):
+        while self._ssd_bytes > self.ssd_max_bytes and self._ssd_lru:
+            self._drop(self._ssd_lru[0])
+
+    def _touch(self, key):
+        try:
+            self._ssd_lru.remove(key)
+            self._ssd_lru.append(key)
+        except ValueError:
+            pass
+
+    def fetch_nearest_cache(self, model, tokens):
+        ram_cache, ram_rest = super().fetch_nearest_cache(model, tokens)
+        ram_prefix = len(tokens) - len(ram_rest) if ram_cache is not None else 0
+        ms = str(model)
+        with self._lock:
+            best, best_len = None, ram_prefix
+            for key in self._ssd:
+                m, tks = key
+                n = len(tks)
+                if m == ms and n > best_len and n <= len(tokens):
+                    if list(tks) == tokens[:n]:
+                        best, best_len = key, n
+            if best is None:
+                return ram_cache, ram_rest
+            path = self._ssd[best][0]
+            self._touch(best)
+        try:
+            cache = load_prompt_cache(path)
+        except Exception:
+            with self._lock:
+                self._drop(best)
+            return ram_cache, ram_rest
+        return cache, tokens[best_len:]
+
+    def insert_cache(self, model, tokens, prompt_cache, *, cache_type="assistant"):
+        super().insert_cache(model, tokens, prompt_cache, cache_type=cache_type)
+        if len(tokens) < self.ssd_min_tokens:
+            return
+        key = (str(model), tuple(tokens))
+        with self._lock:
+            if key in self._ssd:
+                self._touch(key)
+                return
+        spath, jpath = self._paths(model, tokens)
+        nbytes = sum(c.nbytes for c in prompt_cache)
+        try:
+            # Order matters for crash-safety: the .safetensors is written first,
+            # the sidecar .json (the index's source of truth) last, so a partial
+            # write is simply ignored on the next scan.
+            save_prompt_cache(spath, prompt_cache)
+            with open(jpath, "w") as f:
+                json.dump(
+                    {
+                        "salt": self.salt,
+                        "model": key[0],
+                        "tokens": list(tokens),
+                        "nbytes": nbytes,
+                    },
+                    f,
+                )
+        except Exception:
+            try:
+                os.remove(spath)
+            except OSError:
+                pass
+            return
+        with self._lock:
+            if key not in self._ssd:
+                self._ssd[key] = (spath, nbytes)
+                self._ssd_lru.append(key)
+                self._ssd_bytes += nbytes
+            self._ssd_evict()
+
+    @property
+    def ssd_nbytes(self):
+        return self._ssd_bytes
+
+    def ssd_stats(self):
+        return {"n_entries": len(self._ssd), "n_bytes": self._ssd_bytes}
