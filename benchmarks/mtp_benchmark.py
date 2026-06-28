@@ -30,6 +30,26 @@ greedy, decode-only (mean over code/prose/reasoning/list prompts):
 The speedup is exact (lossless) but modest: Qwen3-Next ships a single MTP layer
 (one draft token), and on Apple Silicon the 2-token verify pass costs more than
 a 1-token decode (see ml-explore/mlx#3553), which caps the gain.
+
+Optional: fused gate/up expert projections (ml-explore/mlx-lm#956)
+-----------------------------------------------------------------
+Qwen3-Next's MoE runs the routed experts' gate and up projections as two separate
+gathered matmuls over the same input and indices. Setting ``fuse_gate_up: true``
+(config, or ``--fuse-gate-up`` here) concatenates them at load time into one
+gathered matmul -- one fewer kernel dispatch per MoE layer per token. It is
+opt-in, token-exact, and runtime memory-neutral (the fused weight *replaces* the
+two; only a ~1.7 GB transient appears during the load-time concatenate).
+
+Measured on Apple M5 Max (128 GB), Qwen3-Next-80B-A3B-Instruct-4bit, decode-only:
+
+    mode             unfused    fused    delta    identical
+    plain decode     97 tok/s   106 tok/s  +8.5%   yes
+    MTP decode      117 tok/s   119 tok/s  +1.5%   yes
+
+The plain-decode gain matches #956's reported +8.6% on Qwen3-30B-A3B. Stacked on
+MTP it adds only ~+1.5%: the MTP round already does more work per step (2-token
+verify + draft head), so the per-dispatch saving is largely amortized. For max
+absolute throughput, enable both (118.7 tok/s, 1.22x over the stock baseline).
 """
 
 import argparse
@@ -75,10 +95,16 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--model", required=True, help="Path/repo of an MTP-enabled model.")
     p.add_argument("--max-tokens", type=int, default=256)
+    p.add_argument(
+        "--fuse-gate-up",
+        action="store_true",
+        help="Fuse routed-expert gate/up projections at load (mlx-lm#956).",
+    )
     args = p.parse_args()
 
-    print(f"[load] {args.model}")
-    model, tokenizer = load(args.model)
+    print(f"[load] {args.model}" + (" [fuse_gate_up]" if args.fuse_gate_up else ""))
+    model_config = {"fuse_gate_up": True} if args.fuse_gate_up else None
+    model, tokenizer = load(args.model, model_config=model_config)
     if not hasattr(model, "mtp_forward"):
         raise SystemExit(
             "Model has no MTP head. Convert with mtp_num_hidden_layers=1 (see module docstring)."

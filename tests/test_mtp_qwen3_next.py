@@ -4,46 +4,47 @@ import importlib
 import unittest
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 from mlx_lm.generate import generate_step, mtp_generate_step
 from mlx_lm.models.cache import make_prompt_cache
 
+_TINY_CONFIG = {
+    "model_type": "qwen3_next",
+    "hidden_size": 64,
+    "num_hidden_layers": 4,
+    "intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 32,
+    "linear_num_value_heads": 4,
+    "linear_num_key_heads": 2,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
+    "num_experts": 4,
+    "num_experts_per_tok": 2,
+    "decoder_sparse_step": 1,
+    "shared_expert_intermediate_size": 64,
+    "mlp_only_layers": [],
+    "moe_intermediate_size": 64,
+    "rms_norm_eps": 1e-6,
+    "vocab_size": 256,
+    "rope_theta": 1000.0,
+    "partial_rotary_factor": 0.25,
+    "max_position_embeddings": 128,
+    # full_attention_interval=2 gives a mix of GatedDeltaNet (linear)
+    # and full-attention layers, exercising the SSM rollback path.
+    "full_attention_interval": 2,
+    "tie_word_embeddings": True,
+    "mtp_num_hidden_layers": 1,
+}
 
-def _make_qwen3_next_mtp_model():
+
+def _make_qwen3_next_mtp_model(**overrides):
     """Create a tiny Qwen3-Next model with a native MTP head for testing."""
     module = importlib.import_module("mlx_lm.models.qwen3_next")
-    args = module.ModelArgs.from_dict(
-        {
-            "model_type": "qwen3_next",
-            "hidden_size": 64,
-            "num_hidden_layers": 4,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 32,
-            "linear_num_value_heads": 4,
-            "linear_num_key_heads": 2,
-            "linear_key_head_dim": 16,
-            "linear_value_head_dim": 16,
-            "linear_conv_kernel_dim": 4,
-            "num_experts": 4,
-            "num_experts_per_tok": 2,
-            "decoder_sparse_step": 1,
-            "shared_expert_intermediate_size": 64,
-            "mlp_only_layers": [],
-            "moe_intermediate_size": 64,
-            "rms_norm_eps": 1e-6,
-            "vocab_size": 256,
-            "rope_theta": 1000.0,
-            "partial_rotary_factor": 0.25,
-            "max_position_embeddings": 128,
-            # full_attention_interval=2 gives a mix of GatedDeltaNet (linear)
-            # and full-attention layers, exercising the SSM rollback path.
-            "full_attention_interval": 2,
-            "tie_word_embeddings": True,
-            "mtp_num_hidden_layers": 1,
-        }
-    )
+    args = module.ModelArgs.from_dict({**_TINY_CONFIG, **overrides})
     model = module.Model(args)
     model.set_dtype(mx.float32)
     mx.eval(model.parameters())
@@ -183,6 +184,60 @@ class TestQwen3NextMTP(unittest.TestCase):
                 if len(tokens) >= n_tokens:
                     break
             self.assertEqual(len(tokens), n_tokens, f"kwargs={kwargs}")
+
+
+class TestQwen3NextFusedGateUp(unittest.TestCase):
+    """Opt-in SwitchGLU gate/up fusion (mlx-lm#956). Fusing the two routed-expert
+    projections into one gathered matmul must be numerically identical: the same
+    weights, just concatenated along the output axis and split after the matmul."""
+
+    def test_fused_module_layout(self):
+        fused = _make_qwen3_next_mtp_model(fuse_gate_up=True)
+        moe = fused.model.layers[0].mlp.switch_mlp
+        self.assertTrue(moe.fuse_gate_up)
+        self.assertTrue(hasattr(moe, "gate_up_proj"))
+        self.assertFalse(hasattr(moe, "gate_proj"))
+        # 2x the hidden dim packed into the single fused projection.
+        self.assertEqual(moe.gate_up_proj.output_dims, 2 * moe.down_proj.input_dims)
+
+    def test_sanitize_concatenates_gate_up(self):
+        fused = _make_qwen3_next_mtp_model(fuse_gate_up=True)
+        unfused = _make_qwen3_next_mtp_model()
+        weights = dict(tree_flatten(unfused.parameters()))
+        sanitized = fused.sanitize({k: v for k, v in weights.items()})
+        # Backbone + the MTP layer both get fused; no separate gate/up survive.
+        self.assertTrue(any(".switch_mlp.gate_up_proj.weight" in k for k in sanitized))
+        self.assertTrue(
+            any(
+                "mtp.layers.0.mlp.switch_mlp.gate_up_proj.weight" in k
+                for k in sanitized
+            )
+        )
+        self.assertFalse(any(".switch_mlp.gate_proj.weight" in k for k in sanitized))
+
+    def test_fused_is_numerically_identical(self):
+        """Load identical weights into an unfused and a fused model; backbone and
+        MTP-head logits must match bit-for-bit (concatenate-then-split is exact)."""
+        unfused = _make_qwen3_next_mtp_model()
+        weights = dict(tree_flatten(unfused.parameters()))
+
+        fused = _make_qwen3_next_mtp_model(fuse_gate_up=True)
+        fused.load_weights(list(fused.sanitize({**weights}).items()))
+        mx.eval(fused.parameters())
+
+        inputs = mx.array([[0, 1, 2, 3, 4, 5, 6, 7]])
+        self.assertTrue(
+            mx.array_equal(unfused(inputs), fused(inputs)).item(),
+            "fused backbone logits differ from unfused",
+        )
+
+        hidden = mx.random.normal((1, 1, 64))
+        next_ids = mx.array([[5]])
+        lu = unfused.mtp_forward(hidden, next_ids, unfused.make_mtp_cache())
+        lf = fused.mtp_forward(hidden, next_ids, fused.make_mtp_cache())
+        self.assertTrue(
+            mx.array_equal(lu, lf).item(), "fused MTP logits differ from unfused"
+        )
 
 
 if __name__ == "__main__":

@@ -55,6 +55,11 @@ class ModelArgs(BaseModelArgs):
     # preserving the behaviour of existing community conversions). Set it to 1
     # to build the MTP head and enable native self-speculative decoding.
     mtp_num_hidden_layers: int = 0
+    # Fuse the routed experts' gate and up projections into a single gathered
+    # matmul (one fewer gather per MoE layer per token). Opt-in and off by
+    # default for back-compat with existing conversions; weights are fused at
+    # load time in ``sanitize`` so no extra memory is held. See mlx-lm#956.
+    fuse_gate_up: bool = False
 
 
 @partial(mx.compile, shapeless=True)
@@ -372,7 +377,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+        self.switch_mlp = SwitchGLU(
+            dim, intermediate_size, num_experts, fuse_gate_up=args.fuse_gate_up
+        )
 
         self.shared_expert = Qwen3NextMLP(dim, shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
@@ -609,6 +616,36 @@ class Model(nn.Module):
             return [KVCache() for _ in self.mtp.layers]
         return []
 
+    def _fuse_gate_up_weights(self, weights):
+        """Concatenate the routed experts' gate/up projections into a single
+        ``gate_up_proj`` (gate rows first, then up rows) so ``SwitchGLU`` can run
+        one gathered matmul instead of two. Concatenation is along the output
+        axis (axis=1), which is valid for affine-quantized weights because the
+        quantization groups run along the input axis -- every output row keeps
+        its own scales/biases, so the result is numerically identical. Replaces
+        the two projections in-place, so no extra memory is held."""
+        if not self.args.fuse_gate_up:
+            return weights
+        prefixes = [
+            f"model.layers.{l}.mlp.switch_mlp"
+            for l in range(self.args.num_hidden_layers)
+        ]
+        if hasattr(self, "mtp"):
+            prefixes += [
+                f"mtp.layers.{l}.mlp.switch_mlp"
+                for l in range(self.args.mtp_num_hidden_layers)
+            ]
+        for p in prefixes:
+            if f"{p}.gate_proj.weight" not in weights:
+                continue
+            for sub in ("weight", "scales", "biases"):
+                gk, uk = f"{p}.gate_proj.{sub}", f"{p}.up_proj.{sub}"
+                if gk in weights and uk in weights:
+                    weights[f"{p}.gate_up_proj.{sub}"] = mx.concatenate(
+                        [weights.pop(gk), weights.pop(uk)], axis=1
+                    )
+        return weights
+
     def sanitize(self, weights):
         if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
             # Already-converted (SwitchGLU format) checkpoint: weights are in
@@ -616,7 +653,7 @@ class Model(nn.Module):
             # the MTP weights when this model has no MTP head to receive them.
             if not hasattr(self, "mtp"):
                 weights = {k: v for k, v in weights.items() if "mtp." not in k}
-            return weights
+            return self._fuse_gate_up_weights(weights)
 
         # Raw HF checkpoint path.
         if not hasattr(self, "mtp"):
@@ -669,7 +706,7 @@ class Model(nn.Module):
             if any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
-        return weights
+        return self._fuse_gate_up_weights(weights)
 
     @property
     def quant_predicate(self):
