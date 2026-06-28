@@ -973,7 +973,9 @@ class ResponseGenerator:
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
-            use_mtp = self.model_provider.cli_args.mtp and hasattr(model, "mtp_forward")
+            # `mtp_forward` is always defined; the MTP head (`self.mtp`) only
+            # exists when the checkpoint carries one, so gate on that.
+            use_mtp = self.model_provider.cli_args.mtp and hasattr(model, "mtp")
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if use_mtp:
