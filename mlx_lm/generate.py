@@ -1129,6 +1129,21 @@ def ngram_generate_step(
             elif c.is_trimmable():
                 c.trim(num_draft)
 
+    def _plain_step(yv):
+        """One plain (no-draft) decode step on the lazy token ``yv``.
+
+        Returns ``(next_tok, logprobs)`` as lazy arrays so the caller can build
+        and ``async_eval`` the following step's forward before syncing this one
+        -- the same GPU/host overlap as :func:`generate_step`. Used on the
+        budget-0 (non-echo) path where a verify pass would only add latency.
+        """
+        with mx.stream(generation_stream):
+            logits = model(yv[None], cache=model_cache)[0, -1]
+            quantize_cache_fn(model_cache)
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            next_tok = mx.argmax(logits, axis=-1)[None].astype(mx.uint32)
+        return next_tok, logprobs
+
     with mx.stream(generation_stream):
         y = _prefill(y)
 
@@ -1144,6 +1159,49 @@ def ngram_generate_step(
     draft_budget = num_ngram_draft
     try:
         while ntoks < max_tokens:
+            if draft_budget == 0 and not has_processors:
+                # Fast lazy-pipelined plain decode until echo is re-detected.
+                # One step is dispatched ahead so each forward overlaps the
+                # host-side sync+yield of the prior token (cf. generate_step),
+                # which removes the per-step sync stall that otherwise makes
+                # non-echo turns slower than plain generation. The pipeline runs
+                # one token ahead of ``history``; on handoff back to the verify
+                # path the look-ahead token is emitted so ``y == history[-1]``
+                # (cache reflects ``history[:-1]``) is restored. Output stays
+                # byte-identical: these are ordinary S=1 greedy steps.
+                next_tok, next_lp = _plain_step(y)
+                mx.async_eval(next_tok)
+                while draft_budget == 0 and ntoks < max_tokens:
+                    have_ahead = ntoks + 1 < max_tokens
+                    if have_ahead:
+                        ahead_tok, ahead_lp = _plain_step(next_tok)
+                        mx.async_eval(ahead_tok)
+                    t = next_tok.item()  # sync overlaps the look-ahead forward
+                    history.append(t)
+                    ntoks += 1
+                    yield t, next_lp, False
+                    if ntoks >= max_tokens:
+                        return
+                    block = ntoks // _CACHE_CLEAR_INTERVAL
+                    if block > last_cache_block:
+                        mx.clear_cache()
+                        last_cache_block = block
+                    # Re-arm drafting only on a strict full-length match (the
+                    # cheap echo detector): emit the already-dispatched
+                    # look-ahead token and hand off to the verify path.
+                    if have_ahead and _propose(ngram_max):
+                        draft_budget = 1
+                        a = ahead_tok.item()
+                        history.append(a)
+                        ntoks += 1
+                        yield a, ahead_lp, False
+                        if ntoks >= max_tokens:
+                            return
+                        y = ahead_tok
+                        break
+                    next_tok, next_lp = ahead_tok, ahead_lp
+                continue
+
             remaining = max_tokens - ntoks
             if remaining <= 1:
                 drafts = []  # only the bonus fits; skip the proposer entirely
