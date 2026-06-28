@@ -743,7 +743,11 @@ def mtp_generate_step(
             scaled = masked / temp
             lp_accept = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
         elif _is_greedy:
-            token = mx.argmax(logprobs, axis=-1)
+            # argmax(logits) == argmax(logprobs) (logsumexp is a uniform shift),
+            # so select straight from logits: the per-round accept decision then
+            # no longer transitively depends on the full-vocab logsumexp, letting
+            # it stay lazy (pruned when logprobs are not consumed).
+            token = mx.argmax(logits, axis=-1)
             lp_accept = logprobs
         else:
             token = categorical_sampling(logprobs, temp)
