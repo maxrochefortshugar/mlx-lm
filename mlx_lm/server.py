@@ -683,7 +683,13 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        # MTP is a single-stream generator, so force its requests onto the
+        # non-batched _serve_single path.
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and not self.model_provider.cli_args.mtp
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -967,13 +973,18 @@ class ResponseGenerator:
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
+            use_mtp = self.model_provider.cli_args.mtp and hasattr(model, "mtp_forward")
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
+                if use_mtp:
+                    # Store the MTP head's cache alongside the backbone so both
+                    # are reused with a matching prefix on later turns
+                    # (mtp_generate_step splits prompt_cache at len(model.layers)).
+                    cache += model.make_mtp_cache()
+                elif self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
-            # Process the prompt and generate tokens
-            for gen in stream_generate(
+            gen_kwargs = dict(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=rest,
@@ -981,11 +992,27 @@ class ResponseGenerator:
                 sampler=sampler,
                 logits_processors=logits_processors,
                 prompt_cache=cache,
-                draft_model=draft_model,
+                draft_model=None if use_mtp else draft_model,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
-            ):
+            )
+            if use_mtp:
+                # stream_generate's MTP path samples internally from these
+                # (it ignores `sampler`); logits_processors still apply.
+                s = args.sampling
+                gen_kwargs.update(
+                    mtp=True,
+                    temp=s.temperature,
+                    top_p=s.top_p,
+                    top_k=s.top_k,
+                    min_p=s.min_p,
+                    xtc_probability=s.xtc_probability,
+                    xtc_threshold=s.xtc_threshold,
+                )
+
+            # Process the prompt and generate tokens
+            for gen in stream_generate(**gen_kwargs):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
                 if match_sequence is not None and current_state is None:
@@ -1789,6 +1816,13 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use the model's native Multi-Token Prediction head for "
+        "self-speculative decoding (e.g. Qwen3-Next converted with "
+        "mtp_num_hidden_layers=1). Forces single-stream (non-batched) serving.",
     )
     parser.add_argument(
         "--trust-remote-code",
