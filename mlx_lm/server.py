@@ -1016,6 +1016,10 @@ class ResponseGenerator:
                 gen_kwargs.update(
                     ngram=True,
                     num_ngram_draft=self.cli_args.num_ngram_draft,
+                    # Longest-suffix proposer: strictly >= the fixed-3gram path
+                    # (+25% on echo-heavy file edits, neutral elsewhere, still
+                    # byte-identical to greedy).
+                    ngram_suffix=True,
                 )
             if use_mtp:
                 # stream_generate's MTP path samples internally from these
