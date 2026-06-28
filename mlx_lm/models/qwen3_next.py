@@ -321,32 +321,30 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
 
         if 0 < n_confirmed < S:
-            # Speculative verify step: process the confirmed token(s) and the
-            # draft token(s) as separate chunks so we can snapshot the conv/ssm
-            # carry after the confirmed prefix. On draft rejection the caller
-            # restores this snapshot, which is exact because the carry is the
-            # full recurrent summary up to (and including) the confirmed token.
-            mask_c = mask[:, :n_confirmed] if mask is not None else None
-            mask_d = mask[:, n_confirmed:] if mask is not None else None
-            out_c, conv_c, ssm_c = self._process_chunk(
-                mixed_qkv[:, :n_confirmed],
-                a[:, :n_confirmed],
-                b[:, :n_confirmed],
-                conv_state,
-                ssm_state,
-                mask_c,
+            # Speculative verify step. Process ALL tokens in one unsplit pass so
+            # the conv1d + recurrent kernels get M=S amortization (a split into
+            # per-token chunks roughly doubles their dispatch/state-IO cost). The
+            # rollback carry -- the conv/ssm state after just the confirmed prefix,
+            # needed only if the draft is rejected -- is computed in a second pass
+            # that mlx leaves UNEVALUATED on acceptance: the caller clears
+            # rollback_state (the sole reference) before anything forces it, so
+            # accepted rounds (the common case) pay nothing for it. This is
+            # numerically identical to a hard split because the recurrent carry is
+            # float32, so one M=S pass equals S sequential M=1 steps bit-for-bit.
+            out, conv_f, ssm_f = self._process_chunk(
+                mixed_qkv, a, b, conv_state, ssm_state, mask
             )
             if cache is not None:
+                mask_c = mask[:, :n_confirmed] if mask is not None else None
+                _, conv_c, ssm_c = self._process_chunk(
+                    mixed_qkv[:, :n_confirmed],
+                    a[:, :n_confirmed],
+                    b[:, :n_confirmed],
+                    conv_state,
+                    ssm_state,
+                    mask_c,
+                )
                 cache.rollback_state = (conv_c, ssm_c)
-            out_d, conv_f, ssm_f = self._process_chunk(
-                mixed_qkv[:, n_confirmed:],
-                a[:, n_confirmed:],
-                b[:, n_confirmed:],
-                conv_c,
-                ssm_c,
-                mask_d,
-            )
-            out = mx.concatenate([out_c, out_d], axis=1)
         else:
             lengths = cache.lengths if cache is not None else None
             out, conv_f, ssm_f = self._process_chunk(
