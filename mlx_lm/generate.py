@@ -35,13 +35,16 @@ from .utils import does_model_support_input_embeddings, load
 _CACHE_CLEAR_INTERVAL = 256
 
 # Largest n-gram draft width whose single batched verify pass stays bit-identical
-# to token-by-token decoding on Qwen3-Next. The Gated DeltaNet chunked Metal
-# kernel (gated_delta_kernel) reproduces the sequential recurrence exactly only
-# for short chunks: a verify over [confirmed, *drafts] of length 1 + K matches
-# sequential decoding bit-for-bit through K = 3 (S = 4) and starts to drift at
-# K = 4 (S = 5), which would silently break the lossless guarantee. Draft widths
-# are clamped to this so n-gram output is always byte-identical to greedy.
-_NGRAM_MAX_LOSSLESS_DRAFT = 3
+# to token-by-token decoding on Qwen3-Next. A verify over [confirmed, *drafts] of
+# length S = 1 + K is byte-identical only while every op's reduction order
+# matches the S=1 decode path. The binding constraint is the dense Gated DeltaNet
+# input/output projections (quantized_matmul), whose kernel tiling switches at
+# S = 10, capping K at 8 (S = 9). (The earlier ~1-ULP attention drift at S >= 5
+# is handled separately: Qwen3NextAttention runs per-position single-query SDPA
+# during the verify, see its n_confirmed branch. The Gated DeltaNet recurrence
+# and the routed-expert gather_qmm are both order-invariant in S.) Draft widths
+# are clamped here so n-gram output is always byte-identical to greedy.
+_NGRAM_MAX_LOSSLESS_DRAFT = 8
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -1269,9 +1272,13 @@ def ngram_generate_step(
                     _rollback_to_confirmed(K)
                     if n_acc > 0:
                         with mx.stream(generation_stream):
+                            # n_confirmed=n_acc keeps attention per-position
+                            # (byte-identical to decode) without taking a
+                            # DeltaNet rollback snapshot we don't need here.
                             model(
                                 mx.array(drafts[:n_acc], mx.uint32)[None],
                                 cache=model_cache,
+                                n_confirmed=n_acc,
                             )
                             quantize_cache_fn(model_cache)
                     draft_budget = max(0, draft_budget - 1)

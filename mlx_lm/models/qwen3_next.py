@@ -130,6 +130,7 @@ class Qwen3NextAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -157,9 +158,33 @@ class Qwen3NextAttention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+        if n_confirmed > 0 and L > 1 and cache is not None:
+            # Speculative verify pass. The fused multi-query SDPA kernel is not
+            # bit-identical to the single-query decode kernel (different tiling
+            # reorders the softmax/value accumulation), and that ~1-ULP drift
+            # compounds across the attention layers and breaks the lossless
+            # n-gram guarantee. Run each verify position as its own single-query
+            # SDPA over its causal key range so every position matches what plain
+            # token-by-token decoding would compute, bit-for-bit.
+            prefix = cache.offset - L
+            output = mx.concatenate(
+                [
+                    scaled_dot_product_attention(
+                        queries[:, :, i : i + 1, :],
+                        keys[:, :, : prefix + i + 1, :],
+                        values[:, :, : prefix + i + 1, :],
+                        cache=cache,
+                        scale=self.scale,
+                        mask=None,
+                    )
+                    for i in range(L)
+                ],
+                axis=2,
+            )
+        else:
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(output * mx.sigmoid(gate))
@@ -448,7 +473,9 @@ class Qwen3NextDecoderLayer(nn.Module):
                 self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
             )
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache)
+            r = self.self_attn(
+                self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
+            )
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out

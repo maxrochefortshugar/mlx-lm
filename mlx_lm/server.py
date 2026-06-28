@@ -1855,10 +1855,10 @@ def main():
     parser.add_argument(
         "--num-ngram-draft",
         type=int,
-        default=3,
-        help="Max draft tokens proposed per step for --ngram. Capped at 3, the "
+        default=8,
+        help="Max draft tokens proposed per step for --ngram. Capped at 8, the "
         "widest verify that stays byte-identical to greedy on Qwen3-Next "
-        "(default: 3).",
+        "(default: 8).",
     )
     parser.add_argument(
         "--trust-remote-code",
