@@ -1061,6 +1061,15 @@ def ngram_generate_step(
           is more precise but matches less often. Default: ``3``.
         ngram_min (int): Shortest trailing n-gram tried before giving up.
           Default: ``1``.
+        ngram_suffix (bool): Use the longest-suffix proposer instead of the
+          fixed-length ``ngram_max``..``ngram_min`` scan -- it drafts the
+          continuation after the longest earlier occurrence of the running
+          suffix, raising acceptance on repetitive output. Still byte-identical.
+          Default: ``False``.
+        ngram_prev (List[int], optional): A persistent cross-request store of
+          prior output tokens, also searched by the suffix proposer (only used
+          when ``ngram_suffix`` is set). The caller owns its lifetime and should
+          bound its size to cap memory. Default: ``None``.
 
     Yields:
         Tuple[mx.array, mx.array, bool]: ``(token, log-probabilities, from_draft)``.
